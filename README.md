@@ -68,12 +68,28 @@ On Arch, everything except a launcher:
 sudo pacman -S --needed jq socat wl-mirror swaybg librsvg qrencode libpulse libnotify
 ```
 
+On Fedora (Hyprland itself comes from a COPR, see below):
+
+```bash
+sudo dnf install jq socat wl-mirror swaybg librsvg2-tools qrencode pulseaudio-utils libnotify
+```
+
 ## Install
 
 From the AUR:
 
 ```bash
 yay -S hyprpresent
+```
+
+On Fedora 43 or newer, from the release's RPM. Hyprland isn't in Fedora's own
+repositories; [sdegler/hyprland](https://copr.fedorainfracloud.org/coprs/sdegler/hyprland/)
+has current versions:
+
+```bash
+sudo dnf copr enable sdegler/hyprland     # skip if you already have Hyprland 0.55+
+sudo dnf install https://github.com/akashanil-dev/hyprpresent/releases/download/v1.0.0/hyprpresent-1.0.0-1.fc44.noarch.rpm
+sudo dnf install fuzzel                   # or another launcher, for the picker
 ```
 
 Or from a checkout:
@@ -274,7 +290,7 @@ Nothing runs as root, and nothing reaches the network.
 ## Remove
 
 ```bash
-sudo make uninstall          # or: yay -R hyprpresent
+sudo make uninstall          # or: yay -R hyprpresent, or: sudo dnf remove hyprpresent
 rm -rf ~/.local/state/hyprpresent ~/.config/hyprpresent
 hyprctl reload
 ```
