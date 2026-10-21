@@ -1,0 +1,25 @@
+pkgbase = hyprpresent
+	pkgdesc = Windows-style projector modes (Win+P) for Hyprland: Duplicate without stretching, Extend, Match the TV
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/akashanil-dev/hyprpresent
+	arch = any
+	license = MIT
+	depends = hyprland>=0.55.0
+	depends = bash
+	depends = jq
+	depends = socat
+	depends = util-linux
+	depends = wl-mirror
+	optdepends = fuzzel: picker menu (or walker, wofi, rofi, tofi, bemenu, wmenu)
+	optdepends = swaybg: the card shown in Laptop screen only
+	optdepends = librsvg: text and QR code on the card
+	optdepends = qrencode: QR code on the card
+	optdepends = libpulse: switching the sound output
+	optdepends = ddcutil: brightness of monitors that take DDC/CI
+	optdepends = libnotify: notifications
+	optdepends = waybar: showing the mode in the bar
+	source = hyprpresent-1.0.0.tar.gz::https://github.com/akashanil-dev/hyprpresent/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = 38bd8c2316acb7e234bb7e0a0b46e88d1e2aa9fbe800e22da09586ffbfe69473
+
+pkgname = hyprpresent

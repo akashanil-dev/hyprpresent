@@ -18,7 +18,7 @@ optdepends=(
   'waybar: showing the mode in the bar'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP') # replace with the release tarball's sum: updpkgsums
+sha256sums=('38bd8c2316acb7e234bb7e0a0b46e88d1e2aa9fbe800e22da09586ffbfe69473')
 
 package() {
   cd "$pkgname-$pkgver"
