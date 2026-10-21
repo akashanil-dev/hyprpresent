@@ -76,10 +76,13 @@ sudo dnf install jq socat wl-mirror swaybg librsvg2-tools qrencode pulseaudio-ut
 
 ## Install
 
-From the AUR:
+On Arch, build the package from this repository's PKGBUILD (an AUR package
+will follow; AUR registration is paused for now):
 
 ```bash
-yay -S hyprpresent
+git clone https://github.com/akashanil-dev/hyprpresent.git
+cd hyprpresent/packaging
+makepkg -si
 ```
 
 On Fedora 43 or newer, from the release's RPM. Hyprland isn't in Fedora's own
@@ -290,7 +293,7 @@ Nothing runs as root, and nothing reaches the network.
 ## Remove
 
 ```bash
-sudo make uninstall          # or: yay -R hyprpresent, or: sudo dnf remove hyprpresent
+sudo make uninstall          # or: sudo pacman -R hyprpresent, or: sudo dnf remove hyprpresent
 rm -rf ~/.local/state/hyprpresent ~/.config/hyprpresent
 hyprctl reload
 ```
