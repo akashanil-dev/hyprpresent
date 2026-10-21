@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# hyprpresent-daemon: watches Hyprland's events and keeps displays in line.
+#
+# A display seen before gets its saved mode back silently; a new one starts in
+# Duplicate and opens the picker, like Windows. hyprpresent's display rules live
+# only at runtime, so they are applied again after every config reload. Start it
+# once per session from your Hyprland config:
+#
+#   hl.on("hyprland.start", function() hl.exec_cmd("hyprpresent-daemon") end)
+
+set -uo pipefail
+
+APP=hyprpresent
+CLI="$(dirname "$(readlink -f "$0")")/$APP"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/$APP"
+SOCKET="${XDG_RUNTIME_DIR:-/tmp}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock"
+
+if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} || ! -S $SOCKET ]]; then
+  echo "$APP-daemon: Hyprland isn't running in this session." >&2
+  exit 1
+fi
+command -v socat >/dev/null || { echo "$APP-daemon: socat is required." >&2; exit 1; }
+
+# Stops with a message (and a notification) on a Hyprland without Lua config.
+"$CLI" check >/dev/null || exit 2
+
+# One daemon per Hyprland session.
+mkdir -p "$RUNTIME_DIR"
+exec 8>"$RUNTIME_DIR/daemon-$HYPRLAND_INSTANCE_SIGNATURE.lock"
+flock -n 8 || { echo "$APP-daemon: already running." >&2; exit 0; }
+
+reloaded=0
+displays=0
+pending=0
+deadline=0
+status=0
+
+now() { echo "${EPOCHREALTIME//[.,]/}"; } # microseconds
+
+# Hotplug and reload events come in bursts, and our own changes add more. Act
+# once they settle: each one pushes the deadline back, while the steady stream
+# of unrelated events (window titles, focus) leaves it alone. Displays need a
+# moment to settle; a config reload only needs the runtime rules back quickly,
+# before anyone notices them gone.
+settle() {
+  pending=1
+  deadline=$(($(now) + (displays ? 1200000 : 200000)))
+}
+
+handle() {
+  case $1 in
+    configreloaded*) reloaded=1; settle ;;
+    monitoraddedv2* | monitorremovedv2*) displays=1; settle ;;
+    # Match the TV keeps fullscreen windows inside the mirrored area; the CLI
+    # returns at once in every other mode.
+    "fullscreen>>1") "$CLI" fit 8>&- & ;;
+  esac
+}
+
+# The CLI is idempotent, so a late extra run changes nothing.
+reconcile() {
+  local args=(hotplug)
+  ((reloaded)) && args+=(--force)
+  reloaded=0
+  displays=0
+  pending=0
+  if [[ $("$CLI" "${args[@]}" 8>&-) == new ]]; then
+    setsid -f "$CLI" pick >/dev/null 2>&1 </dev/null 8>&-
+  fi
+}
+
+# The daemon may have missed a reload or a hotplug while it wasn't running, so
+# start from a full apply.
+reloaded=1
+reconcile
+
+while true; do
+  if ((pending)); then
+    left=$((deadline - $(now)))
+    if ((left <= 0)); then
+      reconcile
+      continue
+    fi
+    IFS= read -r -t "$(printf '%d.%06d' $((left / 1000000)) $((left % 1000000)))" line
+    status=$?
+    # read returns >128 on a timeout, and 1 at end of input (Hyprland exited).
+    if ((status == 0)); then
+      handle "$line"
+    elif ((status <= 128)); then
+      break
+    fi
+  else
+    IFS= read -r line || break
+    handle "$line"
+  fi
+done < <(socat -U - "UNIX-CONNECT:$SOCKET")

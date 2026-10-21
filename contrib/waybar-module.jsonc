@@ -1,0 +1,17 @@
+// hyprpresent in Waybar: add "custom/hyprpresent" to a modules list, and this
+// to the config. The icons need a Nerd Font; use "format": "{}" without one.
+"custom/hyprpresent": {
+  "exec": "hyprpresent status --waybar",
+  "return-type": "json",
+  "interval": 5,
+  "format": "{icon} {}",
+  "format-icons": {
+    "internal": "󰌢",
+    "duplicate": "󰍺",
+    "match": "󰍺",
+    "extend": "󰍺",
+    "external": "󰍹",
+    "ignore": "󰍹"
+  },
+  "on-click": "hyprpresent pick"
+}

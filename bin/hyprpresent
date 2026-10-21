@@ -1,0 +1,1359 @@
+#!/bin/bash
+
+# hyprpresent: Windows-style (Win+P) display modes for Hyprland.
+#
+#   hyprpresent pick                        choose a mode from your launcher's menu
+#   hyprpresent set <mode>                  duplicate | match | extend | external | internal | ignore
+#   hyprpresent position <dir>              extend direction: right | left | up | down
+#   hyprpresent scale <up|down|reset>       external display scale
+#   hyprpresent audio [set <id>]            sound outputs as JSON, or switch to one
+#   hyprpresent brightness <up|down|reset>  the external's brightness (DDC/CI)
+#   hyprpresent title [text]                top line of the card shown in Laptop screen
+#                                           only ("Back at 3:15"); no text clears it
+#   hyprpresent status [--waybar]           state as JSON, or as a Waybar module
+#   hyprpresent hotplug [--force]           reconcile after a display was added/removed
+#                                           (--force: a config reload also happened)
+#   hyprpresent reapply                     re-apply after Hyprland reloaded its config
+#   hyprpresent fit                         Match the TV: keep fullscreen windows in the mirrored area
+#   hyprpresent check                       is this Hyprland supported?
+#   hyprpresent version
+#
+# hyprpresent-daemon runs hotplug, reapply and fit on Hyprland's events.
+#
+# Duplicate never uses Hyprland's mirror (it stretches unlike aspect ratios).
+# The external runs at its own native mode, parked out of the cursor's reach, and
+# wl-mirror shows the laptop screen on it scaled to fit with black bars.
+#
+# Rules are applied at runtime with `hyprctl eval`, so no config file is edited.
+# That needs Hyprland 0.55 or newer running a Lua config. A config reload drops
+# the rules; the daemon calls `hyprpresent reapply` afterwards. The laptop
+# display is turned off at runtime too, never with a config reload, which some
+# TVs answer by dropping off the bus.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+APP=hyprpresent
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/$APP"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/$APP/config.json"
+DB="$STATE_DIR/displays.json"
+LOG="$STATE_DIR/$APP.log"
+LOCK="$RUNTIME_DIR/lock"
+APPLIED="$RUNTIME_DIR/applied-${HYPRLAND_INSTANCE_SIGNATURE:-session}"
+MATCH_STATE="$RUNTIME_DIR/match.json" # the strip Match the TV reserved on the laptop
+CARD_STATE="$RUNTIME_DIR/card"        # the output the card is shown on, if any
+INTERNAL_OFF="$RUNTIME_DIR/internal-off" # we turned the laptop display off
+MIRROR_CLASS=at.yrlf.wl_mirror
+MIRROR_CLASS_RE='^at\\.yrlf\\.wl_mirror$' # as a Lua string
+MIRROR_WORKSPACE="name:$APP"
+FAR_POSITION="20000x20000" # out of the cursor's reach, so nothing lands there
+MIN_HZ=49
+SCALES=(1 1.2 1.25 1.33 1.5 1.6 2 2.4 2.5 3)
+
+mkdir -p "$STATE_DIR" "$RUNTIME_DIR"
+[[ -s $DB ]] || echo '{}' >"$DB"
+
+# Tests create a headless output; touching this file makes it count everywhere.
+[[ -f $STATE_DIR/include-headless ]] && HYPRPRESENT_INCLUDE_HEADLESS=1
+
+# Keep the last few hundred lines; enough to see what happened at a talk.
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+  (($(wc -l <"$LOG") > 500)) && tail -n 300 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  return 0
+}
+
+# notify-send is optional; without it messages only reach the log.
+notify() {
+  log "notify: $*"
+  command -v notify-send >/dev/null && notify-send -a "$APP" -i video-display "$@" >/dev/null 2>&1
+  return 0
+}
+
+# A setting from config.json, or DEFAULT.
+setting() {
+  local value=""
+  [[ -s $CONFIG ]] && value=$(jq -r --arg k "$1" '.[$k] // empty | if type == "string" then . else tojson end' "$CONFIG" 2>/dev/null)
+  printf '%s\n' "${value:-${2:-}}"
+}
+
+# hyprctl eval only works under a Lua config (Hyprland 0.55+). Under an older
+# Hyprland or a hyprland.conf every rule would be refused, so stop with a
+# message that says why.
+require_lua() {
+  local reply version
+  reply=$(hyprctl eval 'return true' 2>&1)
+  [[ $reply == ok ]] && return 0
+  if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    echo "$APP: Hyprland isn't running in this session." >&2
+    exit 2
+  fi
+  version=$(hyprctl version -j 2>/dev/null | jq -r '.tag // empty' 2>/dev/null)
+  local message="hyprpresent needs Hyprland 0.55 or newer with a Lua config (~/.config/hypr/hyprland.lua)."
+  [[ -n $version ]] && message+=" This is Hyprland ${version#v}"
+  [[ $reply == *"lua config"* ]] && message+=" with a hyprland.conf config."
+  [[ $reply != *"lua config"* && -n $version ]] && message+="."
+  echo "$APP: $message" >&2
+  [[ -t 2 ]] || notify "hyprpresent can't run" "$message"
+  exit 2
+}
+
+safe_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+hypr() { hyprctl dispatch "$1" >/dev/null 2>&1; }
+
+internal_monitor() {
+  hyprctl monitors all -j | jq -c '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0] // empty'
+}
+
+internal_name() { internal_monitor | jq -r '.name // empty'; }
+
+# The laptop screen is on. It is off with the lid closed (a clamshell setup)
+# or in Second screen only, and then there is nothing to mirror.
+internal_active() {
+  hyprctl monitors all -j | jq -e '.[] | select(.name | test("^(eDP|LVDS|DSI)-")) | select(.disabled == false)' >/dev/null
+}
+
+# Connected external displays, including ones we disabled. FALLBACK is the
+# placeholder Hyprland creates while no real display is up. Virtual outputs
+# (HEADLESS-, WAYLAND-, X11-: streaming, nested sessions) only count with
+# PRESENT_INCLUDE_HEADLESS=1. Displays are told apart by connector name, not by
+# make or description: a TV whose EDID read failed after a hotplug storm has
+# neither, and is still the TV on the cable.
+externals() {
+  hyprctl monitors all -j | jq -c --arg headless "${HYPRPRESENT_INCLUDE_HEADLESS:-0}" '
+    [.[] | select(.name | test("^(eDP|LVDS|DSI)-|^FALLBACK$") | not)
+         | select($headless == "1" or (.name | test("^(HEADLESS|WAYLAND|X11)-") | not))]'
+}
+
+# The display the modes apply to: the first external.
+primary() { externals | jq -c '.[0] // empty'; }
+
+# Hyprland has modes for the display. Without them (EDID never read) nothing
+# can be shown on it, so it must not be the only screen left on.
+usable() { jq -e '.width > 0 or (.availableModes | length) > 0' <<<"$1" >/dev/null; }
+
+# Profiles are saved by description. A display that came up without one (its
+# EDID read failed) gets the profile last used on the same connector instead of
+# a fresh Duplicate one.
+# The key without a trailing EDID serial ("KCM GRANDE TV 0x01010101"), for people.
+display_name() { sed -E 's/ 0x[0-9A-Fa-f]+$//' <<<"$1"; }
+
+display_key() {
+  jq -r --slurpfile db "$DB" '
+    if (.description // "") != "" then .description
+    else .name as $n
+      | ([$db[0] | to_entries[] | select(.value.output == $n)] | max_by(.value.seen // 0) | .key) // $n
+    end' <<<"$1"
+}
+
+# Remember which connector a display was last seen on, for display_key.
+profile_seen() {
+  local key="$1" name="$2" profile
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || return 0
+  profile_put "$key" "$(jq -c --arg n "$name" --argjson t "$(date +%s)" '.output = $n | .seen = $t' <<<"$profile")"
+}
+
+profile_get() { jq -c --arg k "$1" '.[$k] // empty' "$DB"; }
+
+profile_put() {
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/db.XXXXXX")
+  jq --arg k "$1" --argjson p "$2" '.[$k] = $p' "$DB" >"$tmp" && mv "$tmp" "$DB"
+}
+
+profile_field() { jq -r --arg f "$2" '.[$f]' <<<"$1"; }
+
+# Hyprland only accepts scales that divide the mode into whole logical pixels
+# (in 1/120 steps). Round up to the nearest clean value, like Omarchy does.
+clean_scale() {
+  awk -v scale="$1" -v width="$2" -v height="$3" '
+    function gcd(a, b, t) { while (b) { t = a % b; a = b; b = t } return a }
+    BEGIN {
+      g = gcd(width * 120, height * 120)
+      k = int(scale * 120 + 0.5)
+      if (k < 120) k = 120
+      if (k > g) k = g
+      while (g % k != 0) k++
+      printf "%g\n", k / 120
+    }'
+}
+
+# The mode to drive a display at: its native (preferred) mode, unless that is a
+# low-refresh one such as a TV's 4K@30, then the largest mode at 50Hz or more.
+pick_mode() {
+  jq -r --argjson min "$MIN_HZ" '
+    if .disabled != true and .refreshRate >= $min then "preferred"
+    else
+      ([.availableModes[]
+        | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)")
+        | {w: (.w | tonumber), h: (.h | tonumber), r: (.r | tonumber)}
+        | select(.r >= $min)]
+       | max_by([.w * .h, .r])
+       | if . == null then "preferred" else "\(.w)x\(.h)@\(.r)" end)
+    end' <<<"$1"
+}
+
+# Pixel size the chosen mode gives.
+mode_size() {
+  local monitor="$1" mode="$2"
+  if [[ $mode == preferred ]]; then
+    jq -r 'if .disabled != true and .width > 0 then "\(.width) \(.height)"
+           else (.availableModes[0] | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)") | "\(.w) \(.h)") end' <<<"$monitor"
+  else
+    [[ $mode =~ ^([0-9]+)x([0-9]+) ]] && echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+  fi
+}
+
+# Scale that makes any display look like a 1080p one: readable on TVs and
+# projectors whatever their size, unlike Hyprland's PPI-based "auto".
+auto_scale() {
+  clean_scale "$(awk -v h="$2" 'BEGIN { s = h / 1080; printf "%.4f", (s < 1 ? 1 : s) }')" "$1" "$2"
+}
+
+# Profile for a display seen for the first time: Duplicate, like plugging a
+# projector into Windows.
+new_profile() {
+  local monitor="$1" mode w h
+  mode=$(pick_mode "$monitor")
+  read -r w h <<<"$(mode_size "$monitor" "$mode")"
+  jq -nc --arg mode "$mode" --argjson scale "$(auto_scale "$w" "$h")" --argjson w "$w" --argjson h "$h" \
+    '{display: "duplicate", position: "right", mode: $mode, scale: $scale, autoScale: $scale, width: $w, height: $h}'
+}
+
+monitor_rule() {
+  # disabled = false: a runtime rule only turns a display back on when it says so.
+  printf 'hl.monitor({ output = "%s", disabled = false, mode = "%s", position = "%s", scale = %s })\n' "$1" "$2" "$3" "$4"
+}
+
+# Pin the laptop display at the origin with whatever mode and scale the user's
+# config gave it, so parking or placing an external never moves it.
+internal_pin_rule() {
+  local reserve="${1:-}" monitor name
+  monitor=$(internal_monitor)
+  [[ -n $monitor ]] || return 0
+  jq -e '.disabled == false' <<<"$monitor" >/dev/null || return 0
+  name=$(jq -r '.name' <<<"$monitor")
+  safe_name "$name" || return 0
+  jq -r --arg reserve "$reserve" '"hl.monitor({ output = \"\(.name)\", mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform)\(if $reserve == "" then "" else ", reserved_area = { top = \($reserve) }" end) })"' <<<"$monitor"
+}
+
+# Match the TV: the laptop's desktop shrinks to the TV's shape, flush with the
+# bottom of the panel, and only that part is mirrored, so the TV is filled with
+# no bars and nothing stretched. The panel itself stays at its native mode
+# (laptop panels take no other); the space above is reserved, and the bar sits
+# in it. Prints "<strip> <reserve> <width> <height>" in logical pixels, or
+# nothing when the TV isn't wider than the laptop.
+#
+# A reserved area adds to the bar's own, so the reserve is the strip minus the
+# bar. The bar's height is what is reserved now, less our own reserve if it is
+# still in place (a config reload drops it).
+match_geometry() {
+  local monitor="$1" tv_w="$2" tv_h="$3" top prev_reserve=0 prev_total=-1 bar
+  [[ $tv_w =~ ^[0-9]+$ && $tv_h =~ ^[0-9]+$ ]] && ((tv_w > 0 && tv_h > 0)) || return 0
+  [[ -s $MATCH_STATE ]] && read -r prev_reserve prev_total < <(jq -r '"\(.reserve) \(.total)"' "$MATCH_STATE")
+  top=$(jq -r '.reserved[1] // 0' <<<"$monitor")
+  bar=$top
+  ((top == prev_total)) && bar=$((top - prev_reserve))
+  jq -r '"\(.width) \(.height) \(.scale) \(.transform)"' <<<"$monitor" | {
+    read -r w h scale transform
+    ((transform % 2)) && { local t=$w; w=$h; h=$t; }
+    awk -v w="$w" -v h="$h" -v s="$scale" -v tw="$tv_w" -v th="$tv_h" -v bar="$bar" 'BEGIN {
+      W = int(w / s + 0.5); H = int(h / s + 0.5)
+      area = int(W * th / tw + 0.5)
+      if (area >= H) exit
+      strip = H - area
+      reserve = strip - bar; if (reserve < 0) reserve = 0
+      printf "%d %d %d %d\n", strip, reserve, W, area
+    }'
+  }
+}
+
+# Leave Match the TV: give the laptop its full height back, and windows that
+# were held inside the mirrored area go properly fullscreen again.
+match_undo() {
+  local rule addr id
+  [[ -f $MATCH_STATE ]] || return 0
+  rule=$(internal_pin_rule 0)
+  [[ -n $rule ]] && hyprctl eval "$rule" >/dev/null
+  rm -f "$MATCH_STATE"
+  id=$(internal_monitor | jq -r '.id // empty')
+  [[ -n $id ]] || return 0
+  hyprctl clients -j | jq -r --argjson m "$id" '.[] | select(.monitor == $m and .fullscreen == 1 and .fullscreenClient == 2) | .address' |
+    while read -r addr; do
+      [[ $addr =~ ^0x[0-9a-f]+$ ]] && hypr "hl.dsp.window.fullscreen_state({ window = \"address:$addr\", internal = 2, client = 2 })"
+    done
+  return 0
+}
+
+# A window going fullscreen on the laptop would cover the strip too, and the
+# TV would show it cropped. Hold it maximized inside the mirrored area while
+# the app still believes it is fullscreen (and hides its toolbars).
+cmd_fit() {
+  local id addr
+  [[ -s $MATCH_STATE ]] || return 0
+  id=$(internal_monitor | jq -r '.id // empty')
+  [[ -n $id ]] || return 0
+  hyprctl clients -j | jq -r --argjson m "$id" '.[] | select(.monitor == $m and .fullscreen == 2) | .address' |
+    while read -r addr; do
+      [[ $addr =~ ^0x[0-9a-f]+$ ]] && hypr "hl.dsp.window.fullscreen_state({ window = \"address:$addr\", internal = 1, client = 2 })"
+    done
+  return 0
+}
+
+# The rules for every connected external, from its saved profile.
+render_rules() {
+  local list count i monitor name key profile display mode scale position pinned=0
+  list=$(externals)
+  count=$(jq 'length' <<<"$list")
+
+  for ((i = 0; i < count; i++)); do
+    monitor=$(jq -c ".[$i]" <<<"$list")
+    name=$(jq -r '.name' <<<"$monitor")
+    safe_name "$name" || continue
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] || continue
+
+    display=$(profile_field "$profile" display)
+    mode=$(profile_field "$profile" mode)
+    scale=$(profile_field "$profile" scale)
+    position=$(profile_field "$profile" position)
+    [[ $display == ignore ]] && continue
+    [[ $mode =~ ^(preferred|[0-9]+x[0-9]+@[0-9.]+)$ && $scale =~ ^[0-9.]+$ && $position =~ ^(right|left|up|down)$ ]] || continue
+
+    # Only the first external follows the chosen mode; others extend. With the
+    # laptop screen off there is nothing to duplicate, so the external becomes
+    # the main screen until it comes back.
+    ((i > 0)) && display=extend
+    [[ $display =~ ^(duplicate|match)$ ]] && ! internal_active && display=external
+
+    if ((!pinned)); then
+      if [[ -n ${MATCH_GEOM:-} ]]; then
+        internal_pin_rule "$(cut -d' ' -f2 <<<"$MATCH_GEOM")"
+      elif [[ -f $MATCH_STATE ]]; then
+        internal_pin_rule 0
+      else
+        internal_pin_rule
+      fi
+      pinned=1
+    fi
+
+    case $display in
+      # Parked but still driven: some TVs drop off HDMI when their signal
+      # stops and don't come back until power-cycled. The service covers it
+      # with the card instead.
+      internal) monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale" ;;
+      external) monitor_rule "$name" "$mode" auto "$scale" ;;
+      extend) monitor_rule "$name" "$mode" "auto-$position" "$scale" ;;
+      duplicate | match)
+        monitor_rule "$name" "$mode" "$FAR_POSITION" "$scale"
+        printf 'hl.window_rule({ match = { class = "%s" }, fullscreen = true, no_initial_focus = true, no_focus = true, no_anim = true, border_size = 0, idle_inhibit = "always" })\n' "$MIRROR_CLASS_RE"
+        ;;
+    esac
+  done
+}
+
+internal_disabled_by_us() { [[ -f $INTERNAL_OFF ]]; }
+
+# Laptop screen off and on without `hyprctl reload`. A reload re-applies every
+# monitor, and some TVs answer the extra modeset with a hotplug storm that loses
+# their EDID until replugged. INTERNAL_OFF records that we turned it off: a
+# config reload turns it back on, and the daemon's reapply turns it off again.
+INTERNAL_SAVED="$RUNTIME_DIR/internal.json"
+
+internal_off() {
+  local monitor name
+  monitor=$(internal_monitor)
+  [[ -n $monitor ]] || return 1
+  name=$(jq -r '.name' <<<"$monitor")
+  safe_name "$name" || return 1
+  jq -e '.disabled == false' <<<"$monitor" >/dev/null && printf '%s\n' "$monitor" >"$INTERNAL_SAVED"
+  touch "$INTERNAL_OFF"
+  hyprctl eval "hl.monitor({ output = \"$name\", disabled = true })" >/dev/null
+}
+
+# Back to the mode and scale it had before internal_off, or the config's own
+# rule when that is unknown (a daemon restart in between).
+internal_on() {
+  local name rule=""
+  name=$(internal_name)
+  [[ -n $name ]] && safe_name "$name" || return 1
+  rm -f "$INTERNAL_OFF"
+  [[ -s $INTERNAL_SAVED ]] &&
+    rule=$(jq -r --arg n "$name" 'select(.name == $n and .width > 0)
+      | "hl.monitor({ output = \"\(.name)\", disabled = false, mode = \"\(.width)x\(.height)@\(.refreshRate)\", position = \"0x0\", scale = \(.scale), transform = \(.transform) })"' "$INTERNAL_SAVED")
+  if [[ -n $rule ]]; then
+    hyprctl eval "$rule" >/dev/null
+  else
+    hyprctl reload >/dev/null 2>&1
+  fi
+  rm -f "$INTERNAL_SAVED"
+  hypr 'hl.dsp.dpms({ action = "enable" })'
+}
+
+# --- The card ----------------------------------------------------------------
+#
+# Laptop screen only keeps the external driven, because some TVs drop off HDMI
+# when their signal stops and don't come back until power-cycled. swaybg shows a
+# card on it: an optional line for the room ("Back at 3:15"), your name and
+# site, a QR code to it, and the time. `hyprpresent card` draws it as an SVG and
+# redraws it every minute for the clock. Without swaybg the display just shows
+# Hyprland's background, still driven; without rsvg-convert, a plain colour.
+
+card_running() { pgrep -f "[/]$APP card $1\$" >/dev/null; }
+
+card_output() {
+  local output="$1"
+  if [[ -z $output ]]; then
+    [[ -f $CARD_STATE ]] || return 0
+    rm -f "$CARD_STATE"
+    pkill -f "[/]$APP card " 2>/dev/null
+    return 0
+  fi
+  safe_name "$output" || return 0
+  printf '%s\n' "$output" >"$CARD_STATE"
+  card_running "$output" && return 0
+  pkill -f "[/]$APP card " 2>/dev/null
+  command -v swaybg >/dev/null || { log "card: swaybg isn't installed"; return 0; }
+  # 9>&- : the card outlives this script and must not hold its lock.
+  setsid -f "$(readlink -f "$0")" card "$output" >/dev/null 2>&1 </dev/null 9>&-
+}
+
+card_setting() {
+  [[ -s $CONFIG ]] || return 0
+  jq -r --arg k "$1" '.card[$k] // empty | tostring' "$CONFIG" 2>/dev/null | tr -d '\000-\037'
+}
+
+# Text for an SVG: control characters dropped, markup escaped, so a name can
+# never become an element or a link.
+xml_text() { tr -d '\000-\037' <<<"$1" | jq -Rr @html; }
+
+# A colour from the config, or DEFAULT when it isn't a plain #rgb/#rrggbb.
+card_color() {
+  local value
+  value=$(card_setting "$1")
+  [[ $value =~ ^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$ ]] && echo "$value" || echo "$2"
+}
+
+twelve_hour() {
+  case $(card_setting clock24) in
+    true) return 1 ;;
+    false) return 0 ;;
+  esac
+  [[ $(locale t_fmt 2>/dev/null) =~ %[pIr] ]]
+}
+
+# The QR code as a PNG data URI, made only when its text changes.
+card_qr() {
+  local text="$1" cache="$RUNTIME_DIR/qr"
+  [[ -n $text ]] && command -v qrencode >/dev/null || return 0
+  if [[ ! -s $cache.png || ! -f $cache.txt || $(<"$cache.txt") != "$text" ]]; then
+    qrencode -o "$cache.png" -s 16 -m 0 -l M -- "$text" 2>/dev/null || return 0
+    printf '%s' "$text" >"$cache.txt"
+  fi
+  printf 'data:image/png;base64,%s' "$(base64 -w0 "$cache.png")"
+}
+
+# The card as an SVG of W x H pixels. Everything is sized from the height, so
+# it reads the same on a 1080p projector and a 4K TV, and the whole card drifts
+# a little each time so nothing burns into a TV left on all day.
+card_svg() {
+  local w="$1" h="$2" title name site qr font bg fg accent clock qr_uri time meridiem="" date
+  title=$(card_setting title)
+  name=$(card_setting name)
+  site=$(card_setting site)
+  qr=$(card_setting qr)
+  [[ -z $qr && -n $site ]] && { [[ $site =~ ^[a-z]+:// ]] && qr=$site || qr="https://$site"; }
+  font=$(card_setting font | tr -d '"<>&')
+  font=${font:-sans-serif}
+  bg=$(card_color background "#101114")
+  fg=$(card_color foreground "#e8e8e8")
+  accent=$(card_color accent "#8ab4f8")
+  clock=$(card_setting clock)
+  qr_uri=$(card_qr "$qr")
+
+  if twelve_hour; then
+    time=$(date '+%-I:%M')
+    meridiem=$( (($(date +%-H) < 12)) && echo AM || echo PM)
+  else
+    time=$(date '+%H:%M')
+  fi
+  date=$(date '+%A, %-d %B')
+
+  awk -v W="$w" -v H="$h" -v font="$font" -v bg="$bg" -v fg="$fg" -v accent="$accent" \
+    -v title="$(xml_text "$title")" -v name="$(xml_text "$name")" -v site="$(xml_text "$site")" \
+    -v namelen="${#name}" -v qr="$qr_uri" -v clock="$clock" \
+    -v time="$time" -v meridiem="$meridiem" -v date="$(xml_text "$date")" -v seed="$RANDOM" '
+    function text(x, y, size, color, weight, body, extra) {
+      printf "<text x=\"%.0f\" y=\"%.0f\" font-size=\"%.0f\" fill=\"%s\" font-weight=\"%s\"%s>%s</text>\n", x, y, size, color, weight, extra, body
+    }
+    BEGIN {
+      srand(seed)
+      u = H / 1080; if (u < 1) u = 1
+      dx = (rand() * 2 - 1) * 24 * u; dy = (rand() * 2 - 1) * 16 * u
+      identity = (title != "" || name != "" || site != "")
+      showclock = (clock != "false" || !identity)
+
+      printf "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" font-family=\"%s\">\n", W, H, font
+      printf "<rect width=\"100%%\" height=\"100%%\" fill=\"%s\"/>\n<g transform=\"translate(%.0f %.0f)\">\n", bg, dx, dy
+
+      if (identity) {
+        left = 160 * u
+        tile = (qr != "") ? 420 * u : 0
+        room = W - 2 * left - (tile ? tile + 120 * u : 0)
+        # Fit the name on one line: shrink it, never below 72 pixels at 1080p.
+        namesize = 120 * u
+        if (namelen > 0 && namelen * 0.6 * namesize > room) namesize = room / (namelen * 0.6)
+        if (namesize < 72 * u) namesize = 72 * u
+
+        block = 0
+        if (title != "") block += 48 * u + 20 * u + 4 * u + 40 * u
+        if (name != "") block += namesize + 20 * u
+        if (site != "") block += 48 * u
+        y = (H - block) / 2
+
+        if (title != "") {
+          y += 48 * u; text(left, y, 48 * u, accent, 600, title, "")
+          y += 20 * u
+          printf "<rect x=\"%.0f\" y=\"%.0f\" width=\"%.0f\" height=\"%.0f\" rx=\"%.0f\" fill=\"%s\"/>\n", left, y, 120 * u, 4 * u, 2 * u, accent
+          y += 4 * u + 40 * u
+        }
+        if (name != "") { y += namesize * 0.85; text(left, y, namesize, fg, 700, name, ""); y += namesize * 0.15 + 20 * u }
+        if (site != "") { y += 48 * u * 0.85; text(left, y, 48 * u, fg, 400, site, " fill-opacity=\"0.7\"") }
+
+        # Dark on light whatever the colours, so every phone camera reads it.
+        if (tile) {
+          tx = W - left - tile; ty = (H - tile - 72 * u) / 2; pad = 36 * u
+          printf "<rect x=\"%.0f\" y=\"%.0f\" width=\"%.0f\" height=\"%.0f\" rx=\"%.0f\" fill=\"#ffffff\"/>\n", tx, ty, tile, tile, 28 * u
+          printf "<image x=\"%.0f\" y=\"%.0f\" width=\"%.0f\" height=\"%.0f\" href=\"%s\" style=\"image-rendering:pixelated\"/>\n", tx + pad, ty + pad, tile - 2 * pad, tile - 2 * pad, qr
+          text(tx + tile / 2, ty + tile + 56 * u, 32 * u, fg, 400, "Scan to open", " text-anchor=\"middle\" fill-opacity=\"0.6\"")
+        }
+
+        if (showclock) {
+          text(48 * u, H - 48 * u - 36 * u - 16 * u, 96 * u, fg, 600, time (meridiem == "" ? "" : "<tspan font-size=\"" int(40 * u) "\" dx=\"" int(12 * u) "\">" meridiem "</tspan>"), "")
+          text(48 * u, H - 48 * u, 36 * u, fg, 400, date, " fill-opacity=\"0.6\"")
+        }
+      } else {
+        text(W / 2, H / 2, 200 * u, fg, 600, time (meridiem == "" ? "" : "<tspan font-size=\"" int(72 * u) "\" dx=\"" int(20 * u) "\">" meridiem "</tspan>"), " text-anchor=\"middle\"")
+        text(W / 2, H / 2 + 100 * u, 56 * u, fg, 400, date, " text-anchor=\"middle\" fill-opacity=\"0.6\"")
+      }
+      print "</g>\n</svg>"
+    }'
+}
+
+# Runs detached while the card is wanted on OUTPUT: draws it, shows it with
+# swaybg, and redraws it each minute. The new swaybg starts before the old one
+# stops, so the TV never sees a gap.
+cmd_card() {
+  local output="$1" monitor w h old="" new="" file minute="" slot=0
+  safe_name "$output" || exit 1
+  trap '[[ -n $new ]] && kill "$new" 2>/dev/null; exit 0' TERM INT
+  while [[ -s $CARD_STATE && $(<"$CARD_STATE") == "$output" ]]; do
+    # A new minute, or a changed config.json (a new title), redraws it.
+    if [[ "$(date +%H%M) $(stat -c %Y "$CONFIG" 2>/dev/null)" != "$minute" ]]; then
+      minute="$(date +%H%M) $(stat -c %Y "$CONFIG" 2>/dev/null)"
+      monitor=$(monitor_by_name "$output")
+      [[ -n $monitor ]] || break
+      read -r w h < <(jq -r '"\(.width) \(.height)"' <<<"$monitor")
+      old=$new
+      if command -v rsvg-convert >/dev/null && ((w > 0 && h > 0)); then
+        slot=$((1 - slot))
+        file="$RUNTIME_DIR/card-$slot.png"
+        card_svg "$w" "$h" | rsvg-convert -w "$w" -h "$h" -o "$file.tmp" 2>/dev/null && mv "$file.tmp" "$file"
+        swaybg -o "$output" -i "$file" -m fill >/dev/null 2>&1 &
+        new=$!
+      elif [[ -z $old ]]; then
+        swaybg -o "$output" -c "$(card_color background "#101114")" >/dev/null 2>&1 &
+        new=$!
+      fi
+      [[ -n $old && $old != "$new" ]] && { sleep 0.5; kill "$old" 2>/dev/null; }
+    fi
+    sleep 2 &
+    wait $!
+  done
+  [[ -n $new ]] && kill "$new" 2>/dev/null
+  exit 0
+}
+
+monitor_by_name() {
+  hyprctl monitors all -j | jq -c --arg n "$1" '.[] | select(.name == $n)'
+}
+
+# The display ended up the way the mode asks for. Second screen only waits and
+# looks again: the TV's hotplug storm comes a second or two after the modeset.
+mode_took() {
+  local display="$1" name="$2" monitor i
+  for ((i = 0; i < 15; i++)); do
+    monitor=$(monitor_by_name "$name")
+    case $display in
+      # Gone or off counts too: Don't manage, or a TV that dropped out anyway.
+      internal) [[ -z $monitor ]] || jq -e '.disabled == true or .x == 20000' <<<"$monitor" >/dev/null && return 0 ;;
+      extend) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false and .x != 20000' <<<"$monitor" >/dev/null && return 0 ;;
+      duplicate | match) [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null &&
+        { ! internal_active || mirror_running_on "$name"; } && return 0 ;;
+      external)
+        if [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null && ! internal_active; then
+          sleep 2.5
+          monitor=$(monitor_by_name "$name")
+          [[ -n $monitor ]] && usable "$monitor" && jq -e '.disabled == false' <<<"$monitor" >/dev/null && return 0
+          return 1
+        fi
+        ;;
+      *) return 0 ;;
+    esac
+    sleep 0.2
+  done
+  return 1
+}
+
+# wl-mirror runs under `hyprpresent mirror`, which restarts it if it dies: it can
+# crash when a display disappears under it, and a talk shouldn't go dark.
+mirror_running_on() { pgrep -f "[/]$APP mirror $1 " >/dev/null; }
+
+# Only our own mirror: the supervisor takes its wl-mirror down with it, and a
+# wl-mirror someone runs for screen sharing is left alone.
+stop_mirror() {
+  local i
+  pkill -f "[/]$APP mirror " 2>/dev/null || return 0
+  # Wait for it to go, or start_mirror would find it still there and not
+  # start a new one.
+  for ((i = 0; i < 20; i++)); do
+    pgrep -f "[/]$APP mirror " >/dev/null || return 0
+    sleep 0.1
+  done
+  pkill -KILL -f "[/]$APP mirror " 2>/dev/null
+  return 0
+}
+
+# Duplicate is still what the session wants on this display.
+mirror_wanted() {
+  local target="$1" monitor
+  monitor=$(primary)
+  [[ -n $monitor && $(jq -r '.name' <<<"$monitor") == "$target" ]] || return 1
+  [[ $(profile_field "$(profile_get "$(display_key "$monitor")")" display) =~ ^(duplicate|match)$ ]] || return 1
+  internal_active
+}
+
+# REGION ("x,y wxh", layout coordinates) mirrors only that part of the laptop.
+cmd_mirror() {
+  local target="$1" source="$2" region="${3:-}" started status restarts=0 window_start=$SECONDS
+  local args=()
+  safe_name "$target" && safe_name "$source" || exit 1
+  if [[ -n $region ]]; then
+    [[ $region =~ ^[0-9]+,[0-9]+\ [0-9]+x[0-9]+$ ]] || exit 1
+    args=(--region "$region")
+  fi
+  local child=""
+  trap '[[ -n $child ]] && kill "$child" 2>/dev/null; exit 0' TERM INT
+  while true; do
+    started=$SECONDS
+    wl-mirror --fullscreen-output "$target" "${args[@]}" "$source" >/dev/null 2>&1 </dev/null &
+    child=$!
+    wait "$child"
+    status=$?
+    child=""
+    mirror_wanted "$target" || { log "mirror on $target no longer wanted"; break; }
+
+    # Give up on a crash loop rather than flashing the projector forever.
+    ((SECONDS - window_start > 60)) && { restarts=0; window_start=$SECONDS; }
+    if ((++restarts > 5)); then
+      log "wl-mirror keeps exiting ($status); giving up"
+      notify "Duplicate stopped" "wl-mirror keeps exiting. Choose Duplicate again from hyprpresent pick."
+      break
+    fi
+    log "wl-mirror exited ($status); restarting"
+    ((SECONDS - started < 2)) && sleep 1
+    # Settle twice: the display may still be changing when it comes back.
+    (sleep 0.5; settle_mirror "$target" "$source"; sleep 1.5; settle_mirror "$target" "$source") &
+  done
+}
+
+mirror_window() {
+  hyprctl clients -j | jq -c --arg class "$MIRROR_CLASS" '[.[] | select(.class == $class)][0] // empty'
+}
+
+start_mirror() {
+  local target="$1" region="${2:-}" source
+  source=$(internal_name)
+  [[ -n $source ]] && safe_name "$source" || return 1
+
+  if ! command -v wl-mirror >/dev/null; then
+    notify "Duplicate needs wl-mirror" "Install the wl-mirror package, then choose Duplicate again."
+    return 1
+  fi
+
+  # The same target with another region (Duplicate <-> Match the TV) restarts it.
+  if ! pgrep -f "[/]$APP mirror $target $source${region:+ $region}\$" >/dev/null; then
+    stop_mirror
+    # A new output takes the first free workspace (often 1). Open the mirror on
+    # its own workspace on the projector instead, so SUPER + 1-9 stay on the laptop.
+    hypr "hl.dsp.focus({ monitor = \"$target\" })"
+    hypr "hl.dsp.focus({ workspace = \"$MIRROR_WORKSPACE\" })"
+    # 9>&- : the mirror outlives this script and must not hold its lock.
+    setsid -f "$(readlink -f "$0")" mirror "$target" "$source" ${region:+"$region"} >/dev/null 2>&1 </dev/null 9>&-
+  fi
+  settle_mirror "$target" "$source"
+}
+
+# Make sure the mirror sits on its workspace, then give focus back to the
+# laptop: wl-mirror's fullscreen request focuses the projector otherwise, and
+# new windows and SUPER + 1-9 would land on a screen you can't see.
+settle_mirror() {
+  local target="$1" source="$2" window="" address workspace i
+  for ((i = 0; i < 30; i++)); do
+    window=$(mirror_window)
+    [[ -n $window ]] && break
+    sleep 0.1
+  done
+
+  if [[ -n $window ]]; then
+    address=$(jq -r '.address' <<<"$window")
+    workspace=$(jq -r '.workspace.name' <<<"$window")
+    if [[ $address =~ ^0x[0-9a-f]+$ && $workspace != "${MIRROR_WORKSPACE#name:}" ]]; then
+      hypr "hl.dsp.focus({ monitor = \"$target\" })"
+      hypr "hl.dsp.focus({ workspace = \"$MIRROR_WORKSPACE\" })"
+      hypr "hl.dsp.window.move({ window = \"address:$address\", workspace = \"$MIRROR_WORKSPACE\", follow = false })"
+    fi
+    # Fullscreen covers the projector's own bar and notifications. wl-mirror asks
+    # for it, but not every time it lands; "set" is safe to repeat.
+    [[ $address =~ ^0x[0-9a-f]+$ ]] &&
+      hypr "hl.dsp.window.fullscreen({ window = \"address:$address\", mode = \"fullscreen\", action = \"set\" })"
+  else
+    log "mirror window did not appear"
+  fi
+  hypr "hl.dsp.focus({ monitor = \"$source\" })"
+}
+
+# Bring the session in line with the saved profiles. Rules are evaluated only
+# when they changed (or after a config reload dropped them), so repeated
+# hotplug events settle instead of flickering.
+apply() {
+  local force="${1:-0}" monitor display="none" name="" rules line
+  monitor=$(primary)
+  if [[ -n $monitor ]]; then
+    name=$(jq -r '.name' <<<"$monitor")
+    display=$(profile_field "$(profile_get "$(display_key "$monitor")")" display)
+  fi
+
+  # A display Hyprland has no modes for can't show anything: keep the laptop
+  # screen on and wait for it to be replugged.
+  if [[ -n $monitor ]] && ! usable "$monitor"; then
+    log "apply: $name has no modes (EDID not read); laptop screen stays on"
+    [[ $display == external ]] && display=none
+  fi
+
+  if [[ $display == external ]]; then
+    if ! internal_disabled_by_us || internal_active; then
+      stop_mirror
+      rules=$(render_rules)
+      while IFS= read -r line; do [[ -n $line ]] && hyprctl eval "$line" >/dev/null; done <<<"$rules"
+      printf '%s\n' "$rules" >"$APPLIED"
+      card_output ""
+      match_undo
+      internal_off
+      log "apply display=external output=$name (laptop screen off)"
+      return
+    fi
+  elif internal_disabled_by_us; then
+    internal_on
+    log "laptop screen back on"
+    force=1
+  fi
+
+  if [[ -n $monitor ]] && ! usable "$monitor"; then
+    stop_mirror
+    card_output ""
+    rm -f "$APPLIED"
+    return
+  fi
+
+  # A reload dropped the mirror's window rule and moved the projector under it.
+  # Start it fresh once the rules are back, rather than leave it half set up.
+  ((force)) && [[ $display =~ ^(duplicate|match)$ ]] && stop_mirror
+
+  MATCH_GEOM=""
+  if [[ $display == match ]] && internal_active; then
+    MATCH_GEOM=$(match_geometry "$(internal_monitor)" "$(jq -r '.width' <<<"$monitor")" "$(jq -r '.height' <<<"$monitor")")
+    [[ -n $MATCH_GEOM ]] || log "match: $name isn't wider than the laptop; plain Duplicate"
+  fi
+
+  rules=$(render_rules)
+  if ((force)) || [[ ! -f $APPLIED || $(<"$APPLIED") != "$rules" ]]; then
+    log "apply display=$display output=${name:-none}$( ((force)) && echo " (after reload)")"
+    while IFS= read -r line; do
+      [[ -n $line ]] && hyprctl eval "$line" >/dev/null
+    done <<<"$rules"
+    printf '%s\n' "$rules" >"$APPLIED"
+  fi
+
+  if [[ -n $MATCH_GEOM ]]; then
+    local strip reserve width height total
+    read -r strip reserve width height <<<"$MATCH_GEOM"
+    total=$(internal_monitor | jq -r '.reserved[1] // 0')
+    jq -nc --argjson r "$reserve" --argjson t "$total" --argjson s "$strip" --argjson w "$width" --argjson h "$height" \
+      '{reserve: $r, total: $t, strip: $s, width: $w, height: $h}' >"$MATCH_STATE"
+  else
+    match_undo
+  fi
+
+  if [[ $display =~ ^(duplicate|match)$ ]] && internal_active; then
+    card_output ""
+    sleep 0.3 # the output needs a moment after a mode change
+    if [[ -n $MATCH_GEOM ]]; then
+      start_mirror "$name" "0,$strip ${width}x$height"
+      cmd_fit
+    else
+      start_mirror "$name"
+    fi
+  elif [[ $display == internal ]]; then
+    stop_mirror
+    card_output "$name"
+    # Keep new windows and SUPER + 1-9 on the laptop, not the parked TV.
+    [[ -n $(internal_name) ]] && hypr "hl.dsp.focus({ monitor = \"$(internal_name)\" })"
+  else
+    stop_mirror
+    card_output ""
+  fi
+}
+
+with_lock() {
+  exec 9>"$LOCK"
+  flock -w 10 9 || exit 1
+  "$@"
+}
+
+label() {
+  case $1 in
+    duplicate) echo "Duplicate" ;;
+    match) echo "Match the TV" ;;
+    extend) echo "Extend" ;;
+    external) echo "Second screen only" ;;
+    internal) echo "Laptop screen only" ;;
+    ignore) echo "Left to your Hyprland config" ;;
+  esac
+}
+
+require_primary() {
+  monitor=$(primary)
+  if [[ -z $monitor ]]; then
+    notify "No external display connected"
+    exit 1
+  fi
+  name=$(jq -r '.name' <<<"$monitor")
+  if ! usable "$monitor"; then
+    notify "$name isn't ready" "It connected without reporting any modes. Unplug it and plug it back in."
+    exit 1
+  fi
+  key=$(display_key "$monitor")
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || profile=$(new_profile "$monitor")
+}
+
+# Save PROFILE_NEW and apply it, keeping it only if the display really ended up
+# that way. Otherwise the previous profile goes back, so a mode that failed
+# (a TV that dropped out mid-switch) isn't restored at the next plug-in.
+switch_to() {
+  local new="$1" display
+  display=$(profile_field "$new" display)
+  profile_put "$key" "$new"
+  apply
+  mode_took "$display" "$name" && return 0
+
+  log "$display did not take on $name; back to $(profile_field "$profile" display)"
+  profile_put "$key" "$profile"
+  apply 1
+  notify "Couldn't switch to $(label "$display")" "$(display_name "$key") dropped out during the change. Kept $(label "$(profile_field "$profile" display)")."
+  return 1
+}
+
+cmd_set() {
+  local display="$1" monitor name key profile
+  [[ $display =~ ^(duplicate|match|extend|external|internal|ignore)$ ]] || { echo "Unknown mode: $display" >&2; exit 1; }
+  require_primary
+
+  if [[ $display == ignore ]]; then
+    profile_put "$key" "$(jq -c '.display = "ignore"' <<<"$profile")"
+    # Drop our runtime rules: the user's own config takes the display back.
+    stop_mirror
+    card_output ""
+    rm -f "$MATCH_STATE" # the reload below drops its reserve
+    rm -f "$INTERNAL_OFF" "$INTERNAL_SAVED" # and turns the laptop back on
+    rm -f "$APPLIED"
+    hyprctl reload >/dev/null 2>&1
+  else
+    switch_to "$(jq -c --arg d "$display" '.display = $d' <<<"$profile")" || exit 1
+  fi
+  notify "$(label "$display")" "$(display_name "$key")"
+}
+
+cmd_position() {
+  local direction="$1" monitor name key profile
+  [[ $direction =~ ^(right|left|up|down)$ ]] || { echo "Unknown direction: $direction" >&2; exit 1; }
+  require_primary
+  switch_to "$(jq -c --arg p "$direction" '.position = $p | .display = "extend"' <<<"$profile")" || exit 1
+}
+
+cmd_scale() {
+  local step="$1" monitor name key profile current width height next i
+  require_primary
+  current=$(profile_field "$profile" scale)
+  width=$(profile_field "$profile" width)
+  height=$(profile_field "$profile" height)
+
+  case $step in
+    reset) next=$(profile_field "$profile" autoScale) ;;
+    up | down)
+      next=$current
+      if [[ $step == up ]]; then
+        for i in "${SCALES[@]}"; do
+          awk -v a="$i" -v b="$current" 'BEGIN { exit !(a > b + 0.01) }' && { next=$i; break; }
+        done
+      else
+        for ((i = ${#SCALES[@]} - 1; i >= 0; i--)); do
+          awk -v a="${SCALES[i]}" -v b="$current" 'BEGIN { exit !(a < b - 0.01) }' && { next=${SCALES[i]}; break; }
+        done
+      fi
+      next=$(clean_scale "$next" "$width" "$height")
+      ;;
+    *) echo "Usage: present scale <up|down|reset>" >&2; exit 1 ;;
+  esac
+
+  profile_put "$key" "$(jq -c --argjson s "$next" '.scale = $s' <<<"$profile")"
+  apply
+}
+
+# After a display is added or removed: give new displays a profile, apply, and
+# print "new" when the picker should open.
+cmd_hotplug() {
+  local force=0 monitor key
+  [[ ${1:-} == --force ]] && force=1
+  monitor=$(primary)
+  log "hotplug externals=$(externals | jq -r 'map(.name) | join(",")')"
+
+  if [[ -z $monitor ]]; then
+    stop_mirror
+    card_output ""
+    match_undo
+    rm -f "$APPLIED"
+    # Unplugged in Second screen only: turn the laptop back on, or the session
+    # is left with no screen.
+    if internal_disabled_by_us; then
+      rm -f "$INTERNAL_OFF" "$INTERNAL_SAVED"
+      hyprctl reload >/dev/null 2>&1
+      log "external gone: laptop screen back on"
+    fi
+    return
+  fi
+
+  # No modes yet: nothing to profile. apply keeps the laptop screen on.
+  if ! usable "$monitor"; then
+    apply "$force"
+    return
+  fi
+
+  key=$(display_key "$monitor")
+  if [[ -z $(profile_get "$key") ]]; then
+    profile_put "$key" "$(new_profile "$monitor")"
+    profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
+    apply "$force"
+    ddc_probe_later
+    echo "new"
+    return
+  fi
+
+  profile_seen "$key" "$(jq -r '.name' <<<"$monitor")"
+  apply "$force"
+  ((force)) || audio_restore_later "$(profile_field "$(profile_get "$key")" audio)"
+  ddc_probe_later
+  echo "known"
+}
+
+# --- Sound ---------------------------------------------------------------
+#
+# Sound outputs are every card's output ports not known to be unplugged, not
+# just the current sinks: on many laptops the speakers and the headphone jack
+# sit in different card profiles, so the speakers only appear as a sink once
+# the profile is switched. HDMI and DisplayPort outputs are named after the
+# connected display.
+
+audio_outputs() {
+  local cards sinks default ext
+  command -v pactl >/dev/null || { echo '[]'; return; }
+  cards=$(pactl -f json list cards 2>/dev/null) || { echo '[]'; return; }
+  sinks=$(pactl -f json list sinks 2>/dev/null || echo '[]')
+  default=$(pactl get-default-sink 2>/dev/null)
+  ext=$(primary | jq -r '(.description // "") as $d | if $d != "" then ($d | sub(" 0x[0-9A-Fa-f]+$"; "")) else (.name // "") end' 2>/dev/null)
+  jq -c --argjson sinks "$sinks" --arg default "$default" --arg ext "$ext" '
+    [.[] as $card
+     | ($card.ports // {} | to_entries[])
+     | select((.key | startswith("[Out]")) or (.key | test("output"; "i")))
+     | select(.value.availability != "not available")
+     | .key as $port | .value as $p
+     | ([$sinks[] | select(.properties["device.id"] == ($card.index | tostring) and ([.ports[]?.name] | index($port)))][0].name // "") as $sink
+     | {
+         id: ($card.name + "|" + $port),
+         sink: $sink,
+         active: ($sink != "" and $sink == $default),
+         label: (
+           if ($p.type // "") == "HDMI" or ($port | test("hdmi|displayport"; "i")) then (if $ext != "" then $ext else $p.description end)
+           elif ($card.properties["device.bus"] // "") == "bluetooth" then ($card.properties["device.description"] // $p.description)
+           elif ($p.type // "") == "Speaker" or ($port | test("speaker"; "i")) then "Laptop speakers"
+           else $p.description end)
+       }]' <<<"$cards"
+}
+
+audio_sink_for() {
+  local card="$1" port="$2"
+  pactl -f json list cards 2>/dev/null | jq -r --arg c "$card" '.[] | select(.name == $c) | .index' | {
+    read -r index
+    pactl -f json list sinks 2>/dev/null | jq -r --arg i "$index" --arg p "$port" \
+      '[.[] | select(.properties["device.id"] == $i and ([.ports[]?.name] | index($p)))][0].name // empty'
+  }
+}
+
+# Switch to output ID ("card|port"), changing the card's profile first when
+# no current sink has that port.
+audio_select() {
+  local id="$1" card port sink profile i
+  [[ $id == *"|"* ]] || return 1
+  card=${id%%|*}
+  port=${id#*|}
+  audio_outputs | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null || return 1
+  sink=$(audio_sink_for "$card" "$port")
+  if [[ -z $sink ]]; then
+    profile=$(pactl -f json list cards 2>/dev/null | jq -r --arg c "$card" --arg p "$port" '
+      .[] | select(.name == $c) | .profiles as $all
+      | [.ports[$p].profiles[]? | {k: ., v: $all[.]} | select(.v.available != false)]
+      | max_by(.v.priority) | .k // empty')
+    [[ -n $profile ]] || return 1
+    pactl set-card-profile "$card" "$profile" || return 1
+    for ((i = 0; i < 30; i++)); do
+      sink=$(audio_sink_for "$card" "$port")
+      [[ -n $sink ]] && break
+      sleep 0.1
+    done
+  fi
+  [[ -n $sink ]] || return 1
+  pactl set-sink-port "$sink" "$port" 2>/dev/null
+  pactl set-default-sink "$sink"
+}
+
+cmd_audio() {
+  local id monitor key profile
+  if [[ ${1:-} != set ]]; then
+    audio_outputs
+    return
+  fi
+  id="${2:-}"
+  if ! audio_select "$id"; then
+    notify "Couldn't switch the sound" "That output isn't available any more."
+    exit 1
+  fi
+  # Remember it for the connected display, so it comes back on reconnect.
+  monitor=$(primary)
+  if [[ -n $monitor ]] && usable "$monitor"; then
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] && profile_put "$key" "$(jq -c --arg a "$id" '.audio = $a' <<<"$profile")"
+  fi
+  log "audio $id"
+}
+
+# Ask a new display about DDC/CI in the background; it can take seconds.
+ddc_probe_later() {
+  [[ $(profile_field "$(profile_get "$(display_key "$(primary)")")" ddc 2>/dev/null) == null ]] || return 0
+  setsid -f "$(readlink -f "$0")" ddc-probe >/dev/null 2>&1 </dev/null 9>&-
+}
+
+# PipeWire picks HDMI sound by itself a moment after the display appears, so
+# a saved choice is put back after it has had its say.
+audio_restore_later() {
+  local id="$1"
+  [[ -n $id && $id != null ]] || return 0
+  (sleep 3; audio_select "$id" && log "audio restored $id") >/dev/null 2>&1 </dev/null 9>&- &
+  disown
+}
+
+# --- Brightness ------------------------------------------------------------
+#
+# A monitor that speaks DDC/CI gets its real backlight changed with ddcutil.
+# TVs and projectors almost never do; for them brightness isn't offered.
+
+ddc_bus() {
+  local link
+  link=$(readlink -f /sys/class/drm/card*-"$1"/ddc 2>/dev/null | head -1)
+  [[ $link =~ i2c-([0-9]+)$ ]] && echo "${BASH_REMATCH[1]}"
+}
+
+# "current max" from the display, or nothing when it doesn't answer.
+ddc_get() {
+  local bus
+  command -v ddcutil >/dev/null || return 1
+  bus=$(ddc_bus "$1")
+  [[ -n $bus ]] || return 1
+  timeout 8 ddcutil --bus "$bus" getvcp 10 --brief 2>/dev/null | awk '$1 == "VCP" && $3 == "C" { print $4, $5; found = 1 } END { exit !found }'
+}
+
+ddc_set() {
+  local bus
+  bus=$(ddc_bus "$1")
+  [[ -n $bus ]] && timeout 8 ddcutil --bus "$bus" setvcp 10 "$2" >/dev/null 2>&1
+}
+
+# Ask the display once whether it takes brightness commands, and save the
+# answer (and its current brightness) in its profile. Without ddcutil nothing
+# is saved, so installing it later still works.
+ddc_probe() {
+  local key="$1" name="$2" reply profile
+  command -v ddcutil >/dev/null || return 1
+  profile=$(profile_get "$key")
+  [[ -n $profile ]] || return 1
+  if reply=$(ddc_get "$name"); then
+    read -r current max <<<"$reply"
+    profile=$(jq -c --argjson c "$current" --argjson m "$max" '.ddc = true | .brightness = (if $m > 0 then ($c * 100 / $m | floor) else 100 end)' <<<"$profile")
+  else
+    profile=$(jq -c '.ddc = false' <<<"$profile")
+  fi
+  profile_put "$key" "$profile"
+}
+
+cmd_ddc_probe() {
+  local monitor key
+  monitor=$(primary)
+  [[ -n $monitor ]] && usable "$monitor" || return 0
+  key=$(display_key "$monitor")
+  [[ $(profile_field "$(profile_get "$key")" ddc) == null ]] || return 0
+  ddc_probe "$key" "$(jq -r '.name' <<<"$monitor")"
+}
+
+cmd_brightness() {
+  local step="${1:-}" monitor name key profile current next reply max
+  [[ $step =~ ^(up|down|reset)$ ]] || { echo "Usage: $APP brightness <up|down|reset>" >&2; exit 1; }
+  require_primary
+  if ! command -v ddcutil >/dev/null; then
+    notify "Brightness needs ddcutil" "Install the ddcutil package and load the i2c-dev module."
+    exit 1
+  fi
+  [[ $(profile_field "$profile" ddc) == null ]] && { ddc_probe "$key" "$name"; profile=$(profile_get "$key"); }
+  if [[ $(profile_field "$profile" ddc) != true ]]; then
+    notify "Brightness isn't available" "$(display_name "$key") doesn't take brightness commands (DDC/CI)."
+    exit 1
+  fi
+  current=$(jq -r '.brightness // 100' <<<"$profile")
+  case $step in
+    up) next=$((current + 10)) ;;
+    down) next=$((current - 10)) ;;
+    reset) next=100 ;;
+  esac
+  ((next > 100)) && next=100
+  ((next < 0)) && next=0
+  reply=$(ddc_get "$name") && read -r _ max <<<"$reply"
+  ddc_set "$name" "$((next * ${max:-100} / 100))" || notify "Brightness didn't change" "$(display_name "$key") stopped answering."
+  profile_put "$key" "$(jq -c --argjson b "$next" '.brightness = $b' <<<"$profile")"
+}
+
+# The card's settings live under "card" in CONFIG; see the README.
+cmd_title() {
+  local text="$*" current
+  mkdir -p "$(dirname "$CONFIG")"
+  current='{}'
+  [[ -s $CONFIG ]] && current=$(jq -c . "$CONFIG" 2>/dev/null || echo '{}')
+  jq --arg t "$text" '.card.title = $t' <<<"$current" >"$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+}
+
+cmd_status() {
+  local monitor key="" profile="null"
+  monitor=$(primary)
+  # A display without modes can't take any mode yet; the picker shows none.
+  [[ -n $monitor ]] && ! usable "$monitor" && monitor=""
+  if [[ -n $monitor ]]; then
+    key=$(display_key "$monitor")
+    profile=$(profile_get "$key")
+    [[ -n $profile ]] || profile=$(new_profile "$monitor")
+  fi
+
+  jq -nc \
+    --argjson monitor "${monitor:-null}" \
+    --argjson profile "$profile" \
+    --arg key "$key" \
+    --argjson mirror "$(command -v wl-mirror >/dev/null && echo true || echo false)" \
+    --argjson audio "$( [[ ${1:-} == --no-audio ]] && echo '[]' || audio_outputs)" \
+    --argjson ddcutil "$(command -v ddcutil >/dev/null && echo true || echo false)" \
+    '{
+      connected: ($monitor != null),
+      name: ($monitor.name // ""),
+      label: $key,
+      displayName: ($key | sub(" 0x[0-9A-Fa-f]+$"; "")),
+      resolution: (if $monitor == null then "" else "\($profile.width)x\($profile.height)" end),
+      display: ($profile.display // ""),
+      position: ($profile.position // "right"),
+      scale: ($profile.scale // 1),
+      mirrorAvailable: $mirror,
+      audio: $audio,
+      brightness: ($profile.brightness // 100),
+      brightnessMethod: (if $profile.ddc == true then "ddc" elif $profile.ddc == false then "none" else "unknown" end),
+      ddcutil: $ddcutil
+    }'
+}
+
+# A Waybar custom module (return-type json). Empty text hides the module
+# while nothing is connected. Waybar reads tooltips as Pango markup, so the
+# display's name is escaped.
+cmd_waybar() {
+  local status
+  if [[ $(hyprctl eval 'return true' 2>&1) != ok ]]; then
+    jq -nc '{text: "", class: "unsupported", tooltip: "hyprpresent needs Hyprland 0.55+ with a Lua config"}'
+    return
+  fi
+  status=$(cmd_status --no-audio)
+  jq -c '
+    {duplicate: "Duplicate", match: "Match the TV", extend: "Extend", external: "Second screen only",
+     internal: "Laptop screen only", ignore: "Not managed"} as $names
+    | if .connected | not then {text: "", alt: "none", class: "none", tooltip: ""}
+      else ($names[.display] // "Duplicate") as $mode
+      | {text: $mode, alt: (.display // "duplicate"), class: (.display // "duplicate"),
+         tooltip: ("\($mode)\n\(.displayName | gsub("[\u0000-\u001f]"; "") | @html) · \(.resolution)"
+                   + (if .brightnessMethod == "ddc" then "\nBrightness \(.brightness)%" else "" end))}
+      end' <<<"$status"
+}
+
+# --- The picker ------------------------------------------------------------
+#
+# A dmenu-style menu in whatever launcher is installed, or the command set as
+# "menu" in config.json (or $HYPRPRESENT_MENU), which reads the entries on
+# stdin and prints the chosen one; $HYPRPRESENT_PROMPT holds the title.
+
+menu() {
+  local prompt="$1" custom
+  custom=$(setting menu "${HYPRPRESENT_MENU:-}")
+  if [[ -n $custom ]]; then
+    HYPRPRESENT_PROMPT="$prompt" sh -c "$custom"
+  elif command -v fuzzel >/dev/null; then
+    fuzzel --dmenu --prompt "$prompt: "
+  elif command -v walker >/dev/null; then
+    walker --dmenu
+  elif command -v wofi >/dev/null; then
+    wofi --dmenu --insensitive --prompt "$prompt"
+  elif command -v rofi >/dev/null; then
+    rofi -dmenu -i -p "$prompt"
+  elif command -v tofi >/dev/null; then
+    tofi --prompt-text "$prompt: "
+  elif command -v bemenu >/dev/null; then
+    bemenu -i -p "$prompt"
+  elif command -v wmenu >/dev/null; then
+    wmenu -i -p "$prompt"
+  else
+    notify "hyprpresent pick needs a launcher" "Install fuzzel, walker, wofi, rofi, tofi, bemenu or wmenu, or set \"menu\" in $CONFIG."
+    return 1
+  fi
+}
+
+# One menu row: no control characters, so a device name can't add rows.
+row() { tr -d '\000-\037' <<<"$*"; }
+
+# Show ROWS (one per line) and print the index of the chosen one, matching the
+# whole line, so typed text that isn't an entry does nothing.
+choose() {
+  local prompt="$1" rows="$2" choice i=0 line
+  choice=$(printf '%s\n' "$rows" | menu "$prompt") || return 1
+  [[ -n $choice ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == "$choice" ]] && { echo "$i"; return 0; }
+    i=$((i + 1))
+  done <<<"$rows"
+  return 1
+}
+
+cmd_pick() {
+  local status self current rows index modes=(internal duplicate extend external match) labels name i extras=()
+  self=$(readlink -f "$0")
+  status=$(cmd_status)
+  if [[ $(jq -r '.connected' <<<"$status") != true ]]; then
+    notify "No external display connected"
+    exit 1
+  fi
+  current=$(jq -r '.display' <<<"$status")
+  name=$(row "$(jq -r '"\(.displayName) · \(.resolution)"' <<<"$status")")
+  labels=("Laptop screen only" "Duplicate" "Extend" "Second screen only" "Match the TV")
+
+  rows=""
+  for i in "${!modes[@]}"; do
+    rows+="$((i + 1))  ${labels[i]}$([[ ${modes[i]} == "$current" ]] && echo "  ✓")"$'\n'
+  done
+  rows+="Extend direction…"$'\n'; extras+=(position)
+  rows+="Size…"$'\n'; extras+=(scale)
+  [[ $(jq '.audio | length' <<<"$status") -gt 0 ]] && { rows+="Sound…"$'\n'; extras+=(audio); }
+  [[ $(jq -r '.ddcutil and .brightnessMethod != "none"' <<<"$status") == true ]] && { rows+="Brightness…"$'\n'; extras+=(brightness); }
+  rows+="Don't manage this display$([[ $current == ignore ]] && echo "  ✓")"; extras+=(ignore)
+
+  index=$(choose "$name" "$rows") || exit 0
+  if ((index < ${#modes[@]})); then
+    exec "$self" set "${modes[index]}"
+  fi
+  case ${extras[index - ${#modes[@]}]} in
+    position) pick_position "$self" "$status" ;;
+    scale) pick_repeat "$self" scale "Size" "Bigger" up "Smaller" down "Reset" reset ;;
+    audio) pick_audio "$self" "$status" ;;
+    brightness) pick_repeat "$self" brightness "Brightness" "Brighter" up "Dimmer" down "Full brightness" reset ;;
+    ignore) exec "$self" set ignore ;;
+  esac
+}
+
+pick_position() {
+  local self="$1" status="$2" current dirs=(right left up down) labels=("Right of the laptop" "Left of the laptop" "Above the laptop" "Below the laptop") rows="" i index
+  current=$(jq -r '.position' <<<"$status")
+  for i in "${!dirs[@]}"; do
+    rows+="${labels[i]}$([[ ${dirs[i]} == "$current" ]] && echo "  ✓")"$'\n'
+  done
+  index=$(choose "Extend" "${rows%$'\n'}") || exit 0
+  exec "$self" position "${dirs[index]}"
+}
+
+# Size and brightness change in steps, so the menu comes back after each one
+# until it's closed.
+pick_repeat() {
+  local self="$1" command="$2" title="$3" index rows value
+  local labels=("$4" "$6" "$8") args=("$5" "$7" "$9")
+  while true; do
+    if [[ $command == scale ]]; then
+      value="scale $(cmd_status --no-audio | jq -r '.scale')"
+    else
+      value="$(cmd_status --no-audio | jq -r '.brightness')%"
+    fi
+    rows=$(printf '%s\n' "${labels[@]}")
+    index=$(choose "$title ($value)" "$rows") || exit 0
+    "$self" "$command" "${args[index]}" || exit 1
+  done
+}
+
+pick_audio() {
+  local self="$1" status="$2" rows count index
+  count=$(jq '.audio | length' <<<"$status")
+  rows=$(jq -r '.audio | to_entries[] | "\(.key + 1). \(.value.label)\(if .value.active then "  ✓" else "" end)"' <<<"$status" | tr -d '\000-\010\013-\037')
+  index=$(choose "Sound" "$rows") || exit 0
+  ((index < count)) || exit 0
+  exec "$self" audio set "$(jq -r --argjson i "$index" '.audio[$i].id' <<<"$status")"
+}
+
+case "${1:-}" in
+  pick) require_lua; cmd_pick ;;
+  status) if [[ ${2:-} == --waybar ]]; then cmd_waybar; else cmd_status; fi ;;
+  set) require_lua; with_lock cmd_set "${2:-}" ;;
+  position) require_lua; with_lock cmd_position "${2:-}" ;;
+  scale) require_lua; with_lock cmd_scale "${2:-}" ;;
+  hotplug) require_lua; with_lock cmd_hotplug "${2:-}" ;;
+  reapply) require_lua; with_lock apply 1 ;;
+  title) shift; cmd_title "$@" ;;
+  audio) shift; cmd_audio "$@" ;;
+  brightness) with_lock cmd_brightness "${2:-}" ;;
+  ddc-probe) with_lock cmd_ddc_probe ;;
+  fit) require_lua; with_lock cmd_fit ;;
+  mirror) cmd_mirror "${2:-}" "${3:-}" "${4:-}" ;;
+  card) cmd_card "${2:-}" ;;
+  check) require_lua; echo "ok: Hyprland $(hyprctl version -j | jq -r '.tag | ltrimstr("v")') with a Lua config" ;;
+  version | --version) echo "$APP $VERSION" ;;
+  *) sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; [[ ${1:-} =~ ^(-h|--help|help)$ ]] ;;
+esac
